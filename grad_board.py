@@ -157,7 +157,7 @@ class OCRA1:
     def float2bin(self, grad_data, channel=0):
         cv = self.cal_values[channel]
         gd_cal = grad_data * cv[0] + cv[1] # calibration
-        return np.round(131071.49 * gd_cal).astype(np.uint32) & 0x3ffff # 2's complement
+        return np.round(131071.49 * gd_cal).astype(np.int32).astype(np.uint32) & 0x3ffff # 2's complement
 
     def bin2float(self, grad_bin):
         return ( ((grad_bin & 0x3ffff).astype(np.int32) ^ (1 << 17)) - (1 << 17) ).astype(np.int32) / 131072

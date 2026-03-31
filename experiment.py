@@ -175,7 +175,7 @@ class Experiment:
 
         def tx_real(farr):
             """ farr: float array, [-1, 1] """
-            return np.round(32767 * farr).astype(np.uint16)
+            return np.round(32767 * farr).astype(np.int16).view(np.uint16)
 
         def tx_complex(times, farr, tolerance=2e-6):
             """times: float time array, farr: complex float array, [-1-1j, 1+1j]
@@ -433,22 +433,9 @@ class Experiment:
         ios.set_xlabel(r'time ($\mu$s)')
         return fd
 
-    def run(self):
-        """ compile the TX and grad data, send everything over.
-        Returns the resultant data """
-
-        if not self._seq_compiled:
-            self.compile()
-
-        if self._flush_old_rx:
-            rx_data_old, _ = sc.command({'read_rx': 0}, self._s)
-            # TODO: do something with RX data previously collected by the server
-
-        rx_data, msgs = sc.command({'run_seq': self._machine_code.tobytes()}, self._s)
-
-        rxd = rx_data[4]['run_seq']
+    def _scale_rx(self, rxd):
+        """Convert raw RX integer arrays into scaled complex IQ dict."""
         rxd_iq = {}
-
         # (1 << 24) just for the int->float conversion to be reasonable - exact value doesn't matter for now
         rx0_norm_factor = self._rx0_cic_factor / (1 << 24)
         rx1_norm_factor = self._rx0_cic_factor / (1 << 24)
@@ -465,7 +452,53 @@ class Experiment:
         except (KeyError, TypeError):
             pass
 
-        return rxd_iq, msgs
+        return rxd_iq
+
+    def _prepare_run(self):
+        """Compile if needed, flush old RX if configured."""
+        if not self._seq_compiled:
+            self.compile()
+
+        if self._flush_old_rx:
+            rx_data_old, _ = sc.command(
+                {'read_rx': 0},
+                self._s, print_infos=self._print_infos,
+                assert_errors=self._assert_errors
+            )
+            # TODO: do something with RX data previously collected by the server
+
+    def run(self):
+        """ compile the TX and grad data, send everything over.
+        Returns the resultant data """
+        self._prepare_run()
+
+        rx_data, msgs = sc.command(
+            {'run_seq': self._machine_code.tobytes()},
+            self._s, print_infos=self._print_infos,
+            assert_errors=self._assert_errors
+        )
+
+        rxd = rx_data[4]['run_seq']
+        return self._scale_rx(rxd), msgs
+
+    def run_streamed(self):
+        """Like run(), but yields scaled RX chunks as they stream in.
+        The final yield is the (rxd_iq, msgs) tuple, same as run()."""
+        self._prepare_run()
+
+        for msg in sc.streamed_command(
+            {'run_seq': self._machine_code.tobytes()}, self._s,
+            print_infos=self._print_infos, assert_errors=self._assert_errors,
+            stream_response=True,
+        ):
+            if isinstance(msg, tuple):
+                reply, msgs = msg
+                rxd = reply[4]['run_seq']
+                yield self._scale_rx(rxd), msgs
+            else:
+                # intermediate chunk: [type, index, {"rx0_i": [...], ...}]
+                chunk = msg[2]
+                yield self._scale_rx(chunk)
 
     def close_server(self, only_if_sim=False):
         ## Either always close server, or only close server if it's a simulation

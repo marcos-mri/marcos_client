@@ -24,7 +24,7 @@ class ModelTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # TODO make this check for a file first
-        subprocess.call(["make", "-j4", "-s", "-C", os.path.join(marga_sim_path, "build")])
+        subprocess.call(["cmake", "--build", os.path.join(marga_sim_path, "build"), "-j4"])
         subprocess.call(["fallocate", "-l", "516KiB", "/tmp/marcos_server_mem"])
         subprocess.call(["killall", "marga_sim"], stderr=subprocess.DEVNULL) # in case other instances were started earlier
 
@@ -34,25 +34,38 @@ class ModelTest(unittest.TestCase):
         # start simulation
         if marga_sim_fst_dump:
             self.p = subprocess.Popen([os.path.join(marga_sim_path, "build", "marga_sim"), "both", marga_sim_csv, marga_sim_fst],
-                                      stdout=subprocess.DEVNULL,
-                                      stderr=subprocess.STDOUT)
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE)
         else:
             self.p = subprocess.Popen([os.path.join(marga_sim_path, "build", "marga_sim"), "csv", marga_sim_csv],
-                                      stdout=subprocess.DEVNULL,
-                                      stderr=subprocess.STDOUT)
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE)
 
+        # Wait for the server to print its "Listening" line on stderr
+        stderr_lines = []
+        for line in self.p.stderr:
+            stderr_lines.append(line)
+            if b"Listening" in line:
+                break
+        else:
+            self.p.wait()
+            stderr_output = b"".join(stderr_lines).decode(errors="replace")
+            stdout_output = self.p.stdout.read().decode(errors="replace")
+            raise RuntimeError(
+                f"marga_sim exited prematurely with code {self.p.returncode}.\n"
+                f"stderr:\n{stderr_output}\n"
+                f"stdout:\n{stdout_output}"
+            )
 
         # open socket
-        time.sleep(0.05) # give marga_sim time to start up
-
         self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.s.connect((ip_address, port)) # only connect to local simulator
+        self.s.connect((ip_address, port))
         self.packet_idx = 0
 
     def tearDown(self):
-        # self.p.terminate() # if not already terminated
-        # self.p.kill() # if not already terminated
         self.s.close()
+        self.p.stdout.close()
+        self.p.stderr.close()
 
         if marga_sim_fst_dump:
             # open GTKWave
@@ -543,7 +556,7 @@ class ModelTest(unittest.TestCase):
 
     def test_lo_change_expt(self):
         """ Test whether the Experiment class can handle changes in LO frequency, followed by being rerun """
-        expt_args = {'lo_freq': 1, 'auto_leds': False}
+        expt_args = {'lo_freq': 1, 'auto_leds': False, 'assert_errors': False}
         d = {'tx0': (np.array([0, 1]), np.array([0.5, 0])), 'rx0_en': (np.array([2, 3]), np.array([1, 0]))}
 
         def change_lo(e):
@@ -551,9 +564,9 @@ class ModelTest(unittest.TestCase):
             e.set_lo_freq(2)
             return e.run() # compile internally
 
-        # with warnings.catch_warnings():
-        #     warnings.filterwarnings("ignore", category=RuntimeWarning) # catch GPA-FHDO error due to re-initialisation
-        refl, siml = compare_expt_dict(d, "test_lo_change_expt", self.s, self.p, run_fn=change_lo, **expt_args)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="SERVER ERROR.*gradient error", category=RuntimeWarning)  # catch GPA-FHDO error due to re-initialisation
+            refl, siml = compare_expt_dict(d, "test_lo_change_expt", self.s, self.p, run_fn=change_lo, **expt_args)
         self.assertEqual(refl, siml)
 
 if __name__ == "__main__":
