@@ -3,12 +3,14 @@
 # Basic toolbox for server operations; wraps up a lot of stuff to avoid the need for hardcoding on the user's side.
 
 import socket, time, warnings
+from collections.abc import Iterator
 import numpy as np
 import matplotlib.pyplot as plt
 
 from local_config import ip_address, port, fpga_clk_freq_MHz, grad_board
 import grad_board as gb
 import server_comms as sc
+import server_ops as ops
 import marcompile as fc
 
 import pdb
@@ -130,7 +132,7 @@ class Experiment:
             self.gradb.init_hw()
 
         if halt_and_reset:
-            halted = sc.command({'halt_and_reset': 0}, self._s)[0][4]['halt_and_reset']
+            halted, _ = ops.halt_and_reset(self._s)
             assert halted, "Could not halt the execution of an existing sequence. Please file a bug report."
 
         self._fix_cic_scale = fix_cic_scale
@@ -142,7 +144,7 @@ class Experiment:
         if self._close_socket:
             self._s.close()
 
-    def server_command(self, server_dict):
+    def server_command(self, server_dict: dict) -> sc.CommandResult:
         return sc.command(server_dict, self._s, self._print_infos, self._assert_errors)
 
     def get_rx_ts(self):
@@ -433,7 +435,7 @@ class Experiment:
         ios.set_xlabel(r'time ($\mu$s)')
         return fd
 
-    def _scale_rx(self, rxd):
+    def _scale_rx(self, rxd: ops.RxData) -> dict[str, np.ndarray]:
         """Convert raw RX integer arrays into scaled complex IQ dict."""
         rxd_iq = {}
         # (1 << 24) just for the int->float conversion to be reasonable - exact value doesn't matter for now
@@ -454,56 +456,50 @@ class Experiment:
 
         return rxd_iq
 
-    def _prepare_run(self):
+    def _prepare_run(self) -> None:
         """Compile if needed, flush old RX if configured."""
         if not self._seq_compiled:
             self.compile()
 
         if self._flush_old_rx:
-            rx_data_old, _ = sc.command(
-                {'read_rx': 0},
+            ops.read_rx(
                 self._s, print_infos=self._print_infos,
                 assert_errors=self._assert_errors
             )
             # TODO: do something with RX data previously collected by the server
 
-    def run(self):
+    def run(self) -> tuple[dict[str, np.ndarray], sc.StatusDict]:
         """ compile the TX and grad data, send everything over.
         Returns the resultant data """
         self._prepare_run()
 
-        rx_data, msgs = sc.command(
-            {'run_seq': self._machine_code.tobytes()},
+        rxd, msgs = ops.run_seq(
+            self._machine_code.tobytes(),
             self._s, print_infos=self._print_infos,
             assert_errors=self._assert_errors
         )
 
-        rxd = rx_data[4]['run_seq']
         return self._scale_rx(rxd), msgs
 
-    def run_streamed(self):
+    def run_streamed(self) -> Iterator[dict[str, np.ndarray] | tuple[dict[str, np.ndarray], sc.StatusDict]]:
         """Like run(), but yields scaled RX chunks as they stream in.
         The final yield is the (rxd_iq, msgs) tuple, same as run()."""
         self._prepare_run()
 
-        for msg in sc.streamed_command(
-            {'run_seq': self._machine_code.tobytes()}, self._s,
+        for msg in ops.run_seq_streamed(
+            self._machine_code.tobytes(), self._s,
             print_infos=self._print_infos, assert_errors=self._assert_errors,
-            stream_response=True,
         ):
             if isinstance(msg, tuple):
-                reply, msgs = msg
-                rxd = reply[4]['run_seq']
+                rxd, msgs = msg
                 yield self._scale_rx(rxd), msgs
             else:
-                # intermediate chunk: [type, index, {"rx0_i": [...], ...}]
-                chunk = msg[2]
-                yield self._scale_rx(chunk)
+                yield self._scale_rx(msg)
 
-    def close_server(self, only_if_sim=False):
+    def close_server(self, only_if_sim: bool = False) -> None:
         ## Either always close server, or only close server if it's a simulation
-        if not only_if_sim or sc.command({'are_you_real':0}, self._s)[0][4]['are_you_real'] == "simulation":
-            sc.send_packet(sc.construct_packet({}, 0, command=sc.close_server_pkt), self._s)
+        if not only_if_sim or ops.are_you_real(self._s)[0] == "simulation":
+            ops.close_server(self._s)
 
 def test_rx_scaling(lo_freq=0.5, rf_amp=0.5, rf_steps=True, rx_time=50, rx_periods=[600], rx_padding=20, plot_rx=False):
 
